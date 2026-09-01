@@ -39,8 +39,93 @@ def load_env_file(env_path: Path):
             os.environ[key] = value
 
 
+def normalize_secret(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if isinstance(value, dict):
+        for key in ("api_key", "value", "key"):
+            if key in value and value[key] not in (None, ""):
+                value = value[key]
+                break
+        else:
+            return None
+    value = str(value).strip()
+    return value if value else None
+
+
+def find_nested_secret(data, key_names):
+    if isinstance(data, dict):
+        for key in list(data.keys()):
+            lowered = str(key).lower()
+            if lowered in {name.lower() for name in key_names}:
+                return normalize_secret(data[key])
+            if isinstance(data[key], dict):
+                nested = find_nested_secret(data[key], key_names)
+                if nested:
+                    return nested
+            if isinstance(data[key], list):
+                for item in data[key]:
+                    if isinstance(item, dict):
+                        nested = find_nested_secret(item, key_names)
+                        if nested:
+                            return nested
+    return None
+
+
+def load_local_secret_file_candidates():
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parent / ".env",
+        Path.cwd() / ".streamlit" / "secrets.toml",
+        Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
+    ]
+    seen = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        yield path
+
+
+def load_secret_from_files():
+    for candidate in load_local_secret_file_candidates():
+        if not candidate.exists():
+            continue
+        try:
+            if candidate.suffix.lower() == ".toml":
+                try:
+                    import tomllib
+                except ModuleNotFoundError:
+                    tomllib = None
+                if tomllib is not None:
+                    with candidate.open("rb") as fh:
+                        data = tomllib.load(fh)
+                    secret = find_nested_secret(data, ["HOPSWORKS_API_KEY", "hopsworks_api_key", "hopsworks"])
+                    if secret:
+                        return secret
+            else:
+                for line in candidate.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key.lower() == "hopsworks_api_key" and value:
+                        return value
+        except Exception:
+            pass
+    return None
+
+
 for candidate in [Path.cwd() / ".env", Path(__file__).resolve().parent / ".env"]:
     load_env_file(candidate)
+
+secret_from_files = load_secret_from_files()
+if secret_from_files and not os.environ.get("HOPSWORKS_API_KEY"):
+    os.environ["HOPSWORKS_API_KEY"] = secret_from_files
 
 try:
     from dotenv import load_dotenv
@@ -316,24 +401,33 @@ st.markdown(f"""
 # and allow manual entry in the sidebar for deployment use.
 # ============================================================
 def resolve_hopsworks_api_key():
-    # 1) environment or .env file
-    env_key = os.environ.get("HOPSWORKS_API_KEY")
-    if env_key and str(env_key).strip():
-        return str(env_key).strip()
+    env_key = normalize_secret(os.environ.get("HOPSWORKS_API_KEY"))
+    if env_key:
+        return env_key
 
-    # 2) Streamlit Community Cloud secret
+    local_key = load_secret_from_files()
+    if local_key:
+        os.environ["HOPSWORKS_API_KEY"] = local_key
+        return local_key
+
     try:
-        secret_key = st.secrets.get("HOPSWORKS_API_KEY")
-        if secret_key and str(secret_key).strip():
-            return str(secret_key).strip()
+        secret_key = normalize_secret(st.secrets.get("HOPSWORKS_API_KEY"))
+        if secret_key:
+            return secret_key
+        secret_key = normalize_secret(st.secrets.get("hopsworks_api_key"))
+        if secret_key:
+            return secret_key
+        if "hopsworks" in st.secrets:
+            nested = normalize_secret(st.secrets["hopsworks"].get("api_key"))
+            if nested:
+                return nested
     except Exception:
         pass
 
-    # 3) manual input in sidebar
     sidebar_key = st.sidebar.text_input(
         "Hopsworks API key",
         type="password",
-        help="Paste Hopsworks key here if it is not loaded from the environment or Streamlit secrets.",
+        help="Paste Hopsworks key here if it is not loaded from the environment, local secret files, or Streamlit secrets.",
         key="hopsworks_api_key_input",
     )
     if sidebar_key and str(sidebar_key).strip():

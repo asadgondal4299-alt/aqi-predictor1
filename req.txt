@@ -2,10 +2,8 @@ streamlit
 pandas
 numpy
 joblib
-hopsworks
 plotly
 requests
 python-dotenv
 scikit-learn
-shap
 matplotlib

@@ -2,15 +2,23 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import hopsworks
 import os
 import re
 import sys
 import types
 import requests
 import plotly.graph_objects as go
-import shap
 import matplotlib.pyplot as plt
+
+try:
+    import hopsworks
+except Exception:  # pragma: no cover
+    hopsworks = None
+
+try:
+    import shap
+except Exception:  # pragma: no cover
+    shap = None
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
@@ -368,6 +376,13 @@ def extract_model(obj):
 
 
 def compute_shap_contributions(model, feature_names, x_vec):
+    if shap is None:
+        return pd.DataFrame({
+            "feature": feature_names,
+            "shap_value": np.zeros(len(feature_names), dtype=float),
+            "abs_shap": np.zeros(len(feature_names), dtype=float),
+        })
+
     try:
         explainer = shap.Explainer(model)
         explanation = explainer(x_vec)
@@ -394,6 +409,10 @@ def compute_shap_contributions(model, feature_names, x_vec):
 
 
 def render_shap_feature_chart(contrib_df, title):
+    if shap is None:
+        st.caption(f"SHAP is not installed; explainability is unavailable for {title}.")
+        return
+
     top = contrib_df.head(10).copy()
     if top.empty:
         st.caption(f"SHAP data unavailable for {title}.")
@@ -598,6 +617,9 @@ def fetch_live_weather_and_aqi():
 # --- 2. HOPSWORKS MODEL LOADING WITH SAFELY UNPACKED MODEL OBJECT ---
 @st.cache_resource(show_spinner="Hopsworks Registry se Models download aur extract ho rahe hain...")
 def load_all_models(key):
+    if hopsworks is None:
+        raise ModuleNotFoundError("Hopsworks is not installed in this environment. Install it locally or remove the Hopsworks model dependency for deployment.")
+
     project = hopsworks.login(
         host="eu-west.cloud.hopsworks.ai",
         api_key_value=key,

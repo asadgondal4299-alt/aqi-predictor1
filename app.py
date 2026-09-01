@@ -24,7 +24,19 @@ from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy.random._pickle as _npr_pickle
+from numpy.random import MT19937
 
+# Fix: numpy version mismatch causes BitGenerator class object (instead of its name)
+# to be passed during unpickling of models saved with numpy>=2.0
+_original_ctor = _npr_pickle.__bit_generator_ctor
+
+def _patched_bit_generator_ctor(bit_generator_name=MT19937):
+    if isinstance(bit_generator_name, type):
+        bit_generator_name = bit_generator_name.__name__
+    return _original_ctor(bit_generator_name)
+
+_npr_pickle.__bit_generator_ctor = _patched_bit_generator_ctor
 def load_env_file(env_path: Path):
     if not env_path.exists():
         return

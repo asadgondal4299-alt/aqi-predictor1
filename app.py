@@ -15,10 +15,6 @@ try:
 except Exception:  # pragma: no cover
     hopsworks = None
 
-try:
-    import shap
-except Exception:  # pragma: no cover
-    shap = None
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
@@ -481,65 +477,30 @@ def extract_model(obj):
     return None
 
 
-def compute_shap_contributions(model, feature_names, x_vec):
-    if shap is None:
-        return pd.DataFrame({
-            "feature": feature_names,
-            "shap_value": np.zeros(len(feature_names), dtype=float),
-            "abs_shap": np.zeros(len(feature_names), dtype=float),
-        })
+def is_legacy_numpy_state_error(exc):
+    if exc is None:
+        return False
+    msg = str(exc).lower()
+    legacy_markers = (
+        "state is not a legacy",
+        "legacy mt19937",
+        "bitgenerator",
+        "bit_generator",
+        "state must be for a mt19937 prng",
+    )
+    return any(marker in msg for marker in legacy_markers)
 
+
+def load_compat_model_file(file_path):
     try:
-        explainer = shap.Explainer(model)
-        explanation = explainer(x_vec)
-        if isinstance(explanation, list):
-            explanation = explanation[0]
-
-        values = explanation.values
-        if values.ndim == 2 and values.shape[0] == 1:
-            values = values[0]
-
-        names = list(getattr(explanation, "feature_names", feature_names) or feature_names)
-        contrib_df = pd.DataFrame({
-            "feature": names,
-            "shap_value": np.asarray(values, dtype=float),
-        })
-        contrib_df["abs_shap"] = contrib_df["shap_value"].abs()
-        return contrib_df.sort_values("abs_shap", ascending=False)
-    except Exception:
-        return pd.DataFrame({
-            "feature": feature_names,
-            "shap_value": np.zeros(len(feature_names), dtype=float),
-            "abs_shap": np.zeros(len(feature_names), dtype=float),
-        })
-
-
-def render_shap_feature_chart(contrib_df, title):
-    if shap is None:
-        st.caption(f"SHAP is not installed; explainability is unavailable for {title}.")
-        return
-
-    top = contrib_df.head(10).copy()
-    if top.empty:
-        st.caption(f"SHAP data unavailable for {title}.")
-        return
-
-    top = top.sort_values("shap_value", ascending=True)
-    fig, ax = plt.subplots(figsize=(8, 5.5))
-    ax.barh(top["feature"], top["shap_value"], color=["#5dade2" if v >= 0 else "#f39c12" for v in top["shap_value"]])
-    ax.axvline(0, color="#dfe9f3", linewidth=1)
-    ax.set_title(f"Top SHAP Drivers — {title}", color="#e6edf3", fontsize=12)
-    ax.set_xlabel("SHAP value", color="#dfe9f3")
-    ax.set_ylabel("Feature", color="#dfe9f3")
-    ax.tick_params(axis="x", colors="#dfe9f3")
-    ax.tick_params(axis="y", colors="#dfe9f3")
-    ax.grid(True, axis="x", linestyle="--", alpha=0.25)
-    for spine in ax.spines.values():
-        spine.set_color("#2c5364")
-    fig.patch.set_facecolor("#0b1220")
-    ax.set_facecolor("#10192b")
-    fig.tight_layout()
-    st.pyplot(fig)
+        return joblib.load(file_path)
+    except Exception as exc:
+        if is_legacy_numpy_state_error(exc):
+            raise RuntimeError(
+                "This model artifact was pickled with an older NumPy random-state format and is incompatible with the current environment. "
+                "Re-train or re-upload the model using the project’s pinned NumPy/scikit-learn stack."
+            ) from exc
+        raise
 
 # --- 0. BUILD FEATURE VECTOR FOR EACH MODEL HORIZON ---
 @st.cache_data(ttl=86400)
@@ -741,35 +702,47 @@ def load_all_models(key):
     ]
 
     for m_name, m_ver, label in model_info:
-        model_meta = mr.get_model(m_name, version=m_ver)
-        model_dir = model_meta.download()
+        try:
+            model_meta = mr.get_model(m_name, version=m_ver)
+            model_dir = model_meta.download()
 
-        model_obj = None
-        feature_names = None
-        for root, dirs, files in os.walk(model_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                if file == "features.pkl":
-                    feature_names = joblib.load(file_path)
-                elif file.endswith(".pkl") or file.endswith(".joblib"):
+            model_obj = None
+            feature_names = None
+            for root, dirs, files in os.walk(model_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
                     if file == "features.pkl":
-                        continue
-                    raw_obj = joblib.load(file_path)
-                    extracted = extract_model(raw_obj)
-                    if extracted is not None:
-                        model_obj = extracted
-            if model_obj is not None and feature_names is not None:
-                break
+                        feature_names = load_compat_model_file(file_path)
+                    elif file.endswith(".pkl") or file.endswith(".joblib"):
+                        if file == "features.pkl":
+                            continue
+                        try:
+                            raw_obj = load_compat_model_file(file_path)
+                        except RuntimeError as exc:
+                            raise ValueError(
+                                f"{m_name} model artifact is incompatible with the current NumPy/scikit-learn stack: {exc}"
+                            ) from exc
+                        extracted = extract_model(raw_obj)
+                        if extracted is not None:
+                            model_obj = extracted
+                if model_obj is not None and feature_names is not None:
+                    break
 
-        if model_obj is None:
-            raise ValueError(f"No model object found in downloaded artifact for {m_name}.")
-        if feature_names is None:
-            raise ValueError(f"No features.pkl found for {m_name}; cannot build the model input vector.")
+            if model_obj is None:
+                raise ValueError(f"No model object found in downloaded artifact for {m_name}.")
+            if feature_names is None:
+                raise ValueError(f"No features.pkl found for {m_name}; cannot build the model input vector.")
 
-        models_dict[label] = {
-            "model": model_obj,
-            "features": feature_names,
-        }
+            models_dict[label] = {
+                "model": model_obj,
+                "features": feature_names,
+            }
+        except Exception as exc:
+            st.sidebar.warning(
+                f"⚠️ {m_name} model could not be loaded because the Hopsworks artifact is incompatible with the current NumPy/scikit-learn environment. "
+                f"Re-train or re-upload the model from the same stack. Details: {exc}"
+            )
+            continue
 
     return models_dict
 
@@ -893,24 +866,6 @@ if run_forecast:
                         <div class="aqi-hero-date">{advisory}</div>
                     </div>
                     """, unsafe_allow_html=True)
-
-            # ---------------- SHAP EXPLAINABILITY ----------------
-            st.markdown("### 🔍 SHAP Feature Impact")
-            forecast_inputs = []
-            for label in ["Day 1", "Day 2", "Day 3"]:
-                model_info = models[label]
-                x_vec = build_feature_vector(historical, forecast_daily, model_info["features"])
-                forecast_inputs.append({
-                    "label": label,
-                    "model": model_info["model"],
-                    "features": model_info["features"],
-                    "x_vec": x_vec,
-                })
-
-            for item in forecast_inputs:
-                contrib = compute_shap_contributions(item["model"], item["features"], item["x_vec"])
-                st.subheader(f"{item['label']} — Top contributors")
-                render_shap_feature_chart(contrib, item["label"])
 
             # ---------------- GAUGE CHARTS ----------------
             st.markdown("### 🧭 AQI Gauges")

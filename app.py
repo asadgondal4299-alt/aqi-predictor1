@@ -481,6 +481,32 @@ def extract_model(obj):
     return None
 
 
+def is_legacy_numpy_state_error(exc):
+    if exc is None:
+        return False
+    msg = str(exc).lower()
+    legacy_markers = (
+        "state is not a legacy",
+        "legacy mt19937",
+        "bitgenerator",
+        "bit_generator",
+        "state must be for a mt19937 prng",
+    )
+    return any(marker in msg for marker in legacy_markers)
+
+
+def load_compat_model_file(file_path):
+    try:
+        return joblib.load(file_path)
+    except Exception as exc:
+        if is_legacy_numpy_state_error(exc):
+            raise RuntimeError(
+                "This model artifact was pickled with an older NumPy random-state format and is incompatible with the current environment. "
+                "Re-train or re-upload the model using the project’s pinned NumPy/scikit-learn stack."
+            ) from exc
+        raise
+
+
 def compute_shap_contributions(model, feature_names, x_vec):
     if shap is None:
         return pd.DataFrame({
@@ -741,35 +767,47 @@ def load_all_models(key):
     ]
 
     for m_name, m_ver, label in model_info:
-        model_meta = mr.get_model(m_name, version=m_ver)
-        model_dir = model_meta.download()
+        try:
+            model_meta = mr.get_model(m_name, version=m_ver)
+            model_dir = model_meta.download()
 
-        model_obj = None
-        feature_names = None
-        for root, dirs, files in os.walk(model_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                if file == "features.pkl":
-                    feature_names = joblib.load(file_path)
-                elif file.endswith(".pkl") or file.endswith(".joblib"):
+            model_obj = None
+            feature_names = None
+            for root, dirs, files in os.walk(model_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
                     if file == "features.pkl":
-                        continue
-                    raw_obj = joblib.load(file_path)
-                    extracted = extract_model(raw_obj)
-                    if extracted is not None:
-                        model_obj = extracted
-            if model_obj is not None and feature_names is not None:
-                break
+                        feature_names = load_compat_model_file(file_path)
+                    elif file.endswith(".pkl") or file.endswith(".joblib"):
+                        if file == "features.pkl":
+                            continue
+                        try:
+                            raw_obj = load_compat_model_file(file_path)
+                        except RuntimeError as exc:
+                            raise ValueError(
+                                f"{m_name} model artifact is incompatible with the current NumPy/scikit-learn stack: {exc}"
+                            ) from exc
+                        extracted = extract_model(raw_obj)
+                        if extracted is not None:
+                            model_obj = extracted
+                if model_obj is not None and feature_names is not None:
+                    break
 
-        if model_obj is None:
-            raise ValueError(f"No model object found in downloaded artifact for {m_name}.")
-        if feature_names is None:
-            raise ValueError(f"No features.pkl found for {m_name}; cannot build the model input vector.")
+            if model_obj is None:
+                raise ValueError(f"No model object found in downloaded artifact for {m_name}.")
+            if feature_names is None:
+                raise ValueError(f"No features.pkl found for {m_name}; cannot build the model input vector.")
 
-        models_dict[label] = {
-            "model": model_obj,
-            "features": feature_names,
-        }
+            models_dict[label] = {
+                "model": model_obj,
+                "features": feature_names,
+            }
+        except Exception as exc:
+            st.sidebar.warning(
+                f"⚠️ {m_name} model could not be loaded because the Hopsworks artifact is incompatible with the current NumPy/scikit-learn environment. "
+                f"Re-train or re-upload the model from the same stack. Details: {exc}"
+            )
+            continue
 
     return models_dict
 

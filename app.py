@@ -618,7 +618,7 @@ def fetch_live_weather_and_aqi():
 @st.cache_resource(show_spinner="Hopsworks Registry se Models download aur extract ho rahe hain...")
 def load_all_models(key):
     if hopsworks is None:
-        raise ModuleNotFoundError("Hopsworks is not installed in this environment. Install it locally or remove the Hopsworks model dependency for deployment.")
+        return {}
 
     project = hopsworks.login(
         host="eu-west.cloud.hopsworks.ai",
@@ -669,15 +669,25 @@ def load_all_models(key):
 
 models = None
 if api_key:
-    try:
-        models = load_all_models(api_key)
-        st.sidebar.success("✅ Day 1, 2, 3 Models Ready!")
-    except Exception as e:
-        st.sidebar.error(f"Error loading models: {e}")
-        import traceback
-        st.sidebar.code(traceback.format_exc())
+    if hopsworks is None:
+        st.sidebar.warning(
+            "⚠️ Hopsworks library is not installed in this deployment. The app will run without forecast models until Hopsworks is available."
+        )
+        models = {}
+    else:
+        try:
+            models = load_all_models(api_key)
+            if models:
+                st.sidebar.success("✅ Day 1, 2, 3 Models Ready!")
+            else:
+                st.sidebar.warning("⚠️ No forecast models loaded from Hopsworks.")
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ Forecast models could not be loaded: {e}")
+            import traceback
+            st.sidebar.code(traceback.format_exc())
+            models = {}
 else:
-    st.info("👈 HOPSWORKS_API_KEY set nahi hai. Terminal me export karo ya project root me .env file create karo.")
+    st.info("👈 HOPSWORKS_API_KEY set nahi hai. Sidebar me API key paste karo ya .env file me save karo.")
 
 # --- 3. LIVE DATA UI ---
 st.markdown("### 📡 Live Weather & Air Quality — Sargodha")
